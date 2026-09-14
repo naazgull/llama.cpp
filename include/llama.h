@@ -1658,6 +1658,12 @@ extern "C" {
             struct ggml_tensor  * inp_tokens,
             void                * ud);
 
+    // Callback invoked AFTER the graph is allocated and BEFORE it is computed, so the caller can
+    // fill any constant input tensors it created in loss_fn (e.g. one-hot gather masks, reference
+    // log-prob scalars) via ggml_backend_tensor_set — their buffers do not exist until alloc, which
+    // is why this cannot be done inside loss_fn. May be NULL. `ud` is the same userdata.
+    typedef void (*llama_train_fill_fn)(void * ud);
+
     // Run ONE training step over `batch`: build the forward graph, call loss_fn to compose the loss,
     // then forward + (optional) backward + optimizer step via the caller-owned `opt_ctx`.
     // Create `opt_ctx` with ggml_opt_default_params(llama_get_backend_sched(ctx), GGML_OPT_LOSS_TYPE_SUM)
@@ -1667,12 +1673,14 @@ extern "C" {
     //   - the context must use an F32 KV cache and flash_attn disabled (training constraint);
     //   - the KV cache is cleared at the start of each call (each step is independent), and RoPE
     //     positions come from batch.pos (restart them per packed sequence, not globally).
+    // Per-step order: build graph -> loss_fn -> alloc -> set_inputs -> fill_fn -> eval.
     // Returns 0 on success, non-zero on failure.
     LLAMA_API int llama_train_step(
             struct llama_context * ctx,
             struct llama_batch     batch,
             ggml_opt_context_t     opt_ctx,
             llama_train_loss_fn    loss_fn,
+            llama_train_fill_fn    fill_fn,
             void                 * ud,
             bool                   backward);
 

@@ -3566,6 +3566,7 @@ int llama_context::train_step(
         const llama_batch & batch,
         ggml_opt_context_t  opt_ctx,
         llama_train_loss_fn loss_fn,
+        llama_train_fill_fn fill_fn,
         void *              loss_ud,
         bool                backward) {
     // extra graph nodes the caller's loss + the combined forward graph need on top of the model graph
@@ -3675,6 +3676,11 @@ int llama_context::train_step(
 
     // fill the graph input tensors (tokens, positions, masks) from the ubatch - must run after alloc
     res->set_inputs(&ubatch);
+
+    // let the caller fill its own constant inputs (created in loss_fn) now that buffers exist
+    if (fill_fn) {
+        fill_fn(loss_ud);
+    }
 
     ggml_opt_eval(opt_ctx, nullptr);
 
@@ -4475,9 +4481,10 @@ int llama_train_step(
         struct llama_batch     batch,
         ggml_opt_context_t     opt_ctx,
         llama_train_loss_fn    loss_fn,
+        llama_train_fill_fn    fill_fn,
         void                 * ud,
         bool                   backward) {
-    return ctx->train_step(batch, opt_ctx, loss_fn, ud, backward);
+    return ctx->train_step(batch, opt_ctx, loss_fn, fill_fn, ud, backward);
 }
 
 ggml_backend_sched_t llama_get_backend_sched(struct llama_context * ctx) {

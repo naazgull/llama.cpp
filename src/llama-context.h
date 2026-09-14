@@ -223,6 +223,7 @@ struct llama_context {
             const llama_batch & batch,
             ggml_opt_context_t  opt_ctx,
             llama_train_loss_fn loss_fn,
+            llama_train_fill_fn fill_fn,
             void *              loss_ud,
             bool                backward);
 
