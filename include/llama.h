@@ -1608,6 +1608,15 @@ extern "C" {
     // always returns true
     LLAMA_API bool llama_opt_param_filter_all(const struct ggml_tensor * tensor, void * userdata);
 
+    // Mark a loaded model's weight tensors as trainable (GGML_TENSOR_FLAG_PARAM) so ggml_opt
+    // allocates gradients/optimizer state for them. Pass llama_opt_param_filter_all to mark every
+    // F32 weight. Exposed for custom training loops (e.g. DPO): flag the policy model, and never
+    // call this on the frozen reference model.
+    LLAMA_API void llama_model_set_trainable(
+            struct llama_model     * model,
+            llama_opt_param_filter   filter,
+            void                   * userdata);
+
     struct llama_opt_params {
         uint32_t n_ctx_train; // assumed context size post training, use context size specified in llama_context if 0
 
@@ -1630,6 +1639,45 @@ extern "C" {
             int64_t                   idata_split,
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
+
+    //
+    // custom-loss training (additive fork API for DPO / preference optimization)
+    //
+
+    // Callback that composes a custom scalar loss on top of the model's forward graph. Invoked by
+    // llama_train_step after the forward graph is built and before it is allocated/computed.
+    //   ctx_compute : ggml context in which the loss nodes must be allocated (no_alloc)
+    //   logits      : [n_vocab, n_tokens] model output for this batch
+    //   inp_tokens  : [n_tokens] input token-id tensor (for reference)
+    //   ud          : the userdata passed to llama_train_step
+    // Return the scalar loss tensor. ggml_opt reduces it with GGML_OPT_LOSS_TYPE_SUM (a no-op on a
+    // scalar), so the returned value is exactly what gets minimized and back-propagated.
+    typedef struct ggml_tensor * (*llama_train_loss_fn)(
+            struct ggml_context * ctx_compute,
+            struct ggml_tensor  * logits,
+            struct ggml_tensor  * inp_tokens,
+            void                * ud);
+
+    // Run ONE training step over `batch`: build the forward graph, call loss_fn to compose the loss,
+    // then forward + (optional) backward + optimizer step via the caller-owned `opt_ctx`.
+    // Create `opt_ctx` with ggml_opt_default_params(llama_get_backend_sched(ctx), GGML_OPT_LOSS_TYPE_SUM)
+    // (set optimizer/get_opt_pars), then ggml_opt_init(...). Requirements:
+    //   - the whole batch must fit in one ubatch (n_ubatch >= batch.n_tokens) so attention is full
+    //     and differentiable (no cross-ubatch gradient detachment);
+    //   - the context must use an F32 KV cache and flash_attn disabled (training constraint);
+    //   - the KV cache is cleared at the start of each call (each step is independent), and RoPE
+    //     positions come from batch.pos (restart them per packed sequence, not globally).
+    // Returns 0 on success, non-zero on failure.
+    LLAMA_API int llama_train_step(
+            struct llama_context * ctx,
+            struct llama_batch     batch,
+            ggml_opt_context_t     opt_ctx,
+            llama_train_loss_fn    loss_fn,
+            void                 * ud,
+            bool                   backward);
+
+    // The context's backend scheduler; needed to create the ggml_opt_context for llama_train_step.
+    LLAMA_API ggml_backend_sched_t llama_get_backend_sched(struct llama_context * ctx);
 
 #ifdef __cplusplus
 }

@@ -216,6 +216,16 @@ struct llama_context {
             int64_t                          ndata_in_loop,
             int64_t                          t_loop_start);
 
+    // additive fork API: one custom-loss training step (DPO/preference). Builds the forward graph
+    // for `batch`, lets `loss_fn` compose a scalar loss on the logits, then runs forward + backward
+    // + optimizer step through the caller-owned `opt_ctx`. Does not touch opt_epoch_iter.
+    int train_step(
+            const llama_batch & batch,
+            ggml_opt_context_t  opt_ctx,
+            llama_train_loss_fn loss_fn,
+            void *              loss_ud,
+            bool                backward);
+
 private:
     //
     // output

@@ -3560,6 +3560,129 @@ void llama_context::opt_epoch_iter(
     }
 }
 
+// additive fork API: one custom-loss training step (DPO/preference), modeled on opt_epoch_iter but
+// for a single batch and a caller-composed loss instead of the built-in cross-entropy + labels.
+int llama_context::train_step(
+        const llama_batch & batch,
+        ggml_opt_context_t  opt_ctx,
+        llama_train_loss_fn loss_fn,
+        void *              loss_ud,
+        bool                backward) {
+    // extra graph nodes the caller's loss + the combined forward graph need on top of the model graph
+    constexpr int64_t LOSS_HEADROOM = 4096;
+
+    if (cparams.flash_attn) {
+        LLAMA_LOG_INFO("%s: disabling flash attention, FLASH_ATTN_EXT has no backward pass\n", __func__);
+        cparams.flash_attn = false;
+
+        // the graph changes without flash attention, need to reserve again
+        sched_need_reserve = true;
+        sched_reserve();
+    }
+
+    // each step is independent: reset the KV cache + positions (RoPE restarts per sequence via batch.pos)
+    memory->clear(true);
+
+    if (!balloc->init(batch, model.vocab, nullptr, model.hparams.n_embd_inp(), cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true)) {
+        LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
+        return 1;
+    }
+
+    const uint32_t n_tokens_all = balloc->get_n_tokens();
+
+    // the whole (chosen+rejected) batch must be a single ubatch, otherwise attention to earlier
+    // ubatches is detached and gradients do not flow across the boundary
+    if (n_tokens_all > cparams.n_ubatch) {
+        LLAMA_LOG_ERROR("%s: batch has %u tokens but n_ubatch is %u; the whole pair must fit in one ubatch\n",
+                __func__, n_tokens_all, cparams.n_ubatch);
+        return 1;
+    }
+
+    n_queued_tokens += n_tokens_all;
+
+    embd_seq.clear();
+
+    if (output_reserve(n_tokens_all) < n_tokens_all) {
+        LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_tokens_all);
+        return 1;
+    }
+
+    auto mctx = memory->init_batch(*balloc, cparams.n_ubatch, true);
+    if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR("%s: could not initialize batch\n", __func__);
+        return 1;
+    }
+
+    const auto & ubatch = mctx->get_ubatch();
+
+    n_outputs = ubatch.n_tokens;
+
+    if (!mctx->apply()) {
+        LLAMA_LOG_ERROR("%s: failed to update the memory context\n", __func__);
+        return 1;
+    }
+
+    auto * res = gf_res_prev.get();
+
+    const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
+
+    res->reset();
+
+    auto * gf = model.build_graph(gparams);
+    if (!gf) {
+        LLAMA_LOG_ERROR("%s: failed to build the model graph\n", __func__);
+        return 1;
+    }
+
+    // scratch context: holds the caller's loss nodes, the combined forward graph, and ggml_opt's
+    // backward/opt graph duplicates. Sized like opt_epoch_iter plus headroom for the loss.
+    struct ggml_context * ctx_compute = nullptr;
+    {
+        const int64_t size_gf   = ggml_graph_size(gf) + LOSS_HEADROOM;
+        const size_t  size_meta = 4*size_gf*ggml_tensor_overhead() + 3*ggml_graph_overhead_custom(size_gf, /*grads =*/ true);
+
+        struct ggml_init_params params = {
+            /*.mem_size   =*/ size_meta,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+
+        ctx_compute = ggml_init(params);
+        if (!ctx_compute) {
+            LLAMA_LOG_ERROR("%s: failed to allocate the compute context\n", __func__);
+            return 1;
+        }
+    }
+
+    struct ggml_tensor * logits     = res->get_logits();
+    struct ggml_tensor * inp_tokens = res->get_inp_tokens();
+
+    // the caller composes the (scalar) loss on top of the logits using public ggml ops
+    struct ggml_tensor * loss = loss_fn(ctx_compute, logits, inp_tokens, loss_ud);
+    if (!loss) {
+        LLAMA_LOG_ERROR("%s: loss callback returned null\n", __func__);
+        ggml_free(ctx_compute);
+        return 1;
+    }
+
+    // combined forward graph (model + loss). outputs = loss, so with GGML_OPT_LOSS_TYPE_SUM the
+    // minimized value is exactly `loss` (ggml_opt adds its own reduction node on top).
+    struct ggml_cgraph * gf_combined = ggml_new_graph_custom(ctx_compute, ggml_graph_size(gf) + LOSS_HEADROOM, /*grads =*/ true);
+    ggml_build_forward_expand(gf_combined, loss);
+
+    ggml_opt_prepare_alloc(opt_ctx, ctx_compute, gf_combined, inp_tokens, loss);
+    ggml_opt_alloc(opt_ctx, backward);
+
+    // fill the graph input tensors (tokens, positions, masks) from the ubatch - must run after alloc
+    res->set_inputs(&ubatch);
+
+    ggml_opt_eval(opt_ctx, nullptr);
+
+    ggml_free(ctx_compute);
+
+    return 0;
+}
+
 void llama_context::opt_epoch(
         ggml_opt_dataset_t        dataset,
         ggml_opt_result_t         result_train,
@@ -4295,6 +4418,37 @@ bool llama_opt_param_filter_all(const struct ggml_tensor * tensor, void * userda
     return true;
 }
 
+// Additive fork API (DPO): mark a loaded model's weights trainable. Intentionally duplicates the
+// marking loop in llama_context::opt_init instead of refactoring it into a shared helper, so this
+// fork's diff stays purely additive and rebases cleanly onto newer llama.cpp.
+void llama_model_set_trainable(struct llama_model * model, llama_opt_param_filter param_filter, void * param_filter_ud) {
+    if (model == nullptr) {
+        return;
+    }
+
+  //llama_set_param(model->tok_embd,        param_filter, param_filter_ud); // FIXME
+    llama_set_param(model->type_embd,       param_filter, param_filter_ud);
+    llama_set_param(model->pos_embd,        param_filter, param_filter_ud);
+    llama_set_param(model->tok_norm,        param_filter, param_filter_ud);
+    llama_set_param(model->tok_norm_b,      param_filter, param_filter_ud);
+    llama_set_param(model->output_norm,     param_filter, param_filter_ud);
+    llama_set_param(model->output_norm_b,   param_filter, param_filter_ud);
+    llama_set_param(model->output,          param_filter, param_filter_ud);
+    llama_set_param(model->output_b,        param_filter, param_filter_ud);
+    llama_set_param(model->output_norm_enc, param_filter, param_filter_ud);
+    llama_set_param(model->cls,             param_filter, param_filter_ud);
+    llama_set_param(model->cls_b,           param_filter, param_filter_ud);
+    llama_set_param(model->cls_out,         param_filter, param_filter_ud);
+    llama_set_param(model->cls_out_b,       param_filter, param_filter_ud);
+    llama_set_param(model->cls_norm,        param_filter, param_filter_ud);
+
+    for (struct llama_layer & layer : model->layers) {
+        for (size_t i = 0; i < sizeof(layer)/sizeof(struct ggml_tensor *); ++i) {
+            llama_set_param(reinterpret_cast<struct ggml_tensor **>(&layer)[i], param_filter, param_filter_ud);
+        }
+    }
+}
+
 void llama_opt_init(struct llama_context * ctx, struct llama_model * model, struct llama_opt_params lopt_params) {
     ctx->opt_init(model, lopt_params);
 }
@@ -4314,6 +4468,20 @@ void llama_opt_epoch(
         idata_split,
         callback_train,
         callback_eval);
+}
+
+int llama_train_step(
+        struct llama_context * ctx,
+        struct llama_batch     batch,
+        ggml_opt_context_t     opt_ctx,
+        llama_train_loss_fn    loss_fn,
+        void                 * ud,
+        bool                   backward) {
+    return ctx->train_step(batch, opt_ctx, loss_fn, ud, backward);
+}
+
+ggml_backend_sched_t llama_get_backend_sched(struct llama_context * ctx) {
+    return ctx->get_sched();
 }
 
 //
