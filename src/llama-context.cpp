@@ -250,6 +250,8 @@ llama_context::llama_context(
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
 
+    cparams.train_sched_mult = params.train_sched_mult == 0 ? 1 : params.train_sched_mult;
+
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later
     // re-reserve when graph nodes change.
@@ -595,9 +597,14 @@ void llama_context::sched_reserve() {
     const uint32_t n_seqs = cparams.n_seq_max;
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
-    const size_t max_nodes = this->graph_max_nodes(n_tokens);
+    const size_t max_nodes_base = this->graph_max_nodes(n_tokens);
+    // multiplier for the backend-sched node budget: training graphs (backward + optimizer /
+    // grad-norm) exceed the forward-sized default, so the caller can grow it via
+    // cparams.train_sched_mult (1 = no change, the default).
+    const size_t train_sched_mult = (cparams.train_sched_mult > 1) ? (size_t) cparams.train_sched_mult : (size_t) 1;
+    const size_t max_nodes = max_nodes_base * train_sched_mult;
 
-    LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
+    LLAMA_LOG_DEBUG("%s: max_nodes = %zu (base %zu x %zu)\n", __func__, max_nodes, max_nodes_base, train_sched_mult);
 
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
@@ -3767,6 +3774,7 @@ llama_context_params llama_context_default_params() {
         /*.n_rs_seq                    =*/ 0,
         /*.n_outputs_max               =*/ 0,
         /*.n_outputs_max_per_seq       =*/ 1,
+        /*.train_sched_mult            =*/ 1,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,

@@ -127,6 +127,11 @@ extern "C" {
 
         // only GGML_OPT_OPTIMIZER_TYPE_ADAMW needs m, v momenta per parameter tensor
         enum ggml_opt_optimizer_type optimizer;
+
+        // optional global gradient-norm clip. when > 0, the optimizer step applies a scaled
+        // learning rate lr * min(1, max_grad_norm / ||g||) so the effective update is bounded.
+        // 0 disables clipping (default, no behavior change).
+        float max_grad_norm;
     };
 
     // get parameters for an optimization context with defaults set where possible
