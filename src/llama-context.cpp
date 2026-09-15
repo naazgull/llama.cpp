@@ -3568,7 +3568,8 @@ int llama_context::train_step(
         llama_train_loss_fn loss_fn,
         llama_train_fill_fn fill_fn,
         void *              loss_ud,
-        bool                backward) {
+        bool                backward,
+        float *             loss_out) {
     // extra graph nodes the caller's loss + the combined forward graph need on top of the model graph
     constexpr int64_t LOSS_HEADROOM = 4096;
 
@@ -3693,6 +3694,12 @@ int llama_context::train_step(
     }
 
     ggml_opt_eval(opt_ctx, nullptr);
+
+    // capture the scalar loss by value BEFORE freeing the scratch context: the loss tensor
+    // (opt_ctx->loss) lives in ctx_compute and would be dangling once it is freed.
+    if (loss_out) {
+        ggml_backend_tensor_get(ggml_opt_loss(opt_ctx), loss_out, 0, sizeof(float));
+    }
 
     ggml_free(ctx_compute);
 
@@ -4493,8 +4500,9 @@ int llama_train_step(
         llama_train_loss_fn    loss_fn,
         llama_train_fill_fn    fill_fn,
         void                 * ud,
-        bool                   backward) {
-    return ctx->train_step(batch, opt_ctx, loss_fn, fill_fn, ud, backward);
+        bool                   backward,
+        float                * loss_out) {
+    return ctx->train_step(batch, opt_ctx, loss_fn, fill_fn, ud, backward, loss_out);
 }
 
 ggml_backend_sched_t llama_get_backend_sched(struct llama_context * ctx) {

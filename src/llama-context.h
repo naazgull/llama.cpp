@@ -225,7 +225,8 @@ struct llama_context {
             llama_train_loss_fn loss_fn,
             llama_train_fill_fn fill_fn,
             void *              loss_ud,
-            bool                backward);
+            bool                backward,
+            float *             loss_out);
 
 private:
     //

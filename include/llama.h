@@ -1675,6 +1675,9 @@ extern "C" {
     //     positions come from batch.pos (restart them per packed sequence, not globally).
     // Per-step order: build graph -> loss_fn -> alloc -> set_inputs -> fill_fn -> eval.
     // Returns 0 on success, non-zero on failure.
+    // `loss_out` (may be NULL): receives the scalar loss value BY VALUE for this step. The loss
+    // tensor itself is allocated in a scratch context that is freed when the step returns, so
+    // read this value rather than ggml_opt_loss() after the call (the tensor is then dangling).
     LLAMA_API int llama_train_step(
             struct llama_context * ctx,
             struct llama_batch     batch,
@@ -1682,7 +1685,8 @@ extern "C" {
             llama_train_loss_fn    loss_fn,
             llama_train_fill_fn    fill_fn,
             void                 * ud,
-            bool                   backward);
+            bool                   backward,
+            float                * loss_out);
 
     // The context's backend scheduler; needed to create the ggml_opt_context for llama_train_step.
     LLAMA_API ggml_backend_sched_t llama_get_backend_sched(struct llama_context * ctx);
