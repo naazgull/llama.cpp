@@ -3668,7 +3668,17 @@ int llama_context::train_step(
 
     // combined forward graph (model + loss). outputs = loss, so with GGML_OPT_LOSS_TYPE_SUM the
     // minimized value is exactly `loss` (ggml_opt adds its own reduction node on top).
+    //
+    // We must expand with the FULL model graph, not just `loss`: build_graph appends the KV-cache
+    // update nodes (cpy_k/cpy_v) as side effects that are NOT in the logits dependency chain (the
+    // attention reads the cache via get_k/get_v views, independent of those writes). Expanding from
+    // `loss` alone would drop those nodes and, with them, their k_idxs/v_idxs input leaves - leaving
+    // those input tensors unallocated (buffer == nullptr) and crashing in res->set_inputs below.
     struct ggml_cgraph * gf_combined = ggml_new_graph_custom(ctx_compute, ggml_graph_size(gf) + LOSS_HEADROOM, /*grads =*/ true);
+    const int n_gf_nodes = ggml_graph_n_nodes(gf);
+    for (int i = 0; i < n_gf_nodes; ++i) {
+        ggml_build_forward_expand(gf_combined, ggml_graph_node(gf, i));
+    }
     ggml_build_forward_expand(gf_combined, loss);
 
     ggml_opt_prepare_alloc(opt_ctx, ctx_compute, gf_combined, inp_tokens, loss);
