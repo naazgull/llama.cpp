@@ -551,7 +551,9 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     // tensor). dup must be of gb_grad, NOT gf: ggml_graph_dup only copies nodes (it does not build
     // a backward), so a dup of the forward-only gf would carry no gradients and ||g|| would be empty.
     if (opt_ctx->max_grad_norm > 0.0f) {
-        opt_ctx->gb_opt_norm = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gb_grad, /*force_grads =*/ true);
+        // force_grads=false: the grads buffer is allocated by the backend sched in ggml_opt_eval,
+        // after the norm nodes below are appended (pre-allocating it here would size it without them).
+        opt_ctx->gb_opt_norm = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gb_grad, /*force_grads =*/ false);
         ggml_tensor * norm_sum = nullptr;
         for (int i = opt_ctx->gf->n_nodes - 1; i >= 0; --i) {
             struct ggml_tensor * node = opt_ctx->gb_opt_norm->nodes[i];
@@ -571,7 +573,6 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             ggml_set_name(opt_ctx->grad_norm, "grad_norm");
             ggml_set_output(opt_ctx->grad_norm);
             ggml_build_forward_expand(opt_ctx->gb_opt_norm, opt_ctx->grad_norm);
-            ggml_graph_reset(opt_ctx->gb_opt_norm);
         }
     }
 
