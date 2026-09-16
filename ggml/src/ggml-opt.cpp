@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cinttypes>
+#include <iostream>
 #include <map>
 #include <random>
 #include <vector>
@@ -826,13 +827,17 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
                 // (in-kernel) lr so the fused SGD step applies the clipped update. weight decay
                 // is 0 in this setup, so scaling pars[0] only affects the grad step, not wd.
                 if (opt_ctx->max_grad_norm > 0.0f) {
+                    std::cerr << "[gradclip] A reset gb_grad" << std::endl;
                     ggml_graph_reset(opt_ctx->gb_grad);
                     ggml_backend_sched_reset(opt_ctx->backend_sched);
-                    ggml_backend_sched_alloc_graph(opt_ctx->backend_sched, opt_ctx->gb_grad);
-                    ggml_backend_sched_graph_compute(opt_ctx->backend_sched, opt_ctx->gb_grad);
+                    const bool ok1 = ggml_backend_sched_alloc_graph(opt_ctx->backend_sched, opt_ctx->gb_grad);
+                    std::cerr << "[gradclip] B alloc gb_grad ok=" << ok1 << std::endl;
+                    const enum ggml_status st1 = ggml_backend_sched_graph_compute(opt_ctx->backend_sched, opt_ctx->gb_grad);
+                    std::cerr << "[gradclip] C compute gb_grad status=" << (int) st1 << std::endl;
                     double nrm = 0.0;
                     const size_t chunk = 1 << 20;
                     std::vector<float> buf(chunk);
+                    int nread = 0;
                     for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
                         const struct ggml_tensor * node = opt_ctx->gf->nodes[i];
                         if (!(node->flags & GGML_TENSOR_FLAG_PARAM)) continue;
@@ -844,15 +849,19 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
                             ggml_backend_tensor_get(grad, buf.data(), off * sizeof(float), n * sizeof(float));
                             for (size_t k = 0; k < n; ++k) nrm += (double)buf[k] * (double)buf[k];
                         }
+                        nread++;
                     }
                     const float norm = (float)std::sqrt(nrm);
                     const float clip_scale = (norm > opt_ctx->max_grad_norm) ?
                         opt_ctx->max_grad_norm / (norm + 1e-8f) : 1.0f;
                     sgd[0] *= clip_scale;
-                    // re-zero the grads so the step graph's backward starts from a clean state.
+                    std::cerr << "[gradclip] D read " << nread << " grads norm=" << norm << " scale=" << clip_scale << std::endl;
+                    ggml_backend_sched_synchronize(opt_ctx->backend_sched);
+                    std::cerr << "[gradclip] E post-read sync ok" << std::endl;
                     ggml_graph_reset(opt_ctx->gb_grad);
                     ggml_backend_sched_reset(opt_ctx->backend_sched);
-                    ggml_backend_sched_alloc_graph(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
+                    const bool ok2 = ggml_backend_sched_alloc_graph(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
+                    std::cerr << "[gradclip] F alloc step graph ok=" << ok2 << std::endl;
                 }
             } break;
             default:
