@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cinttypes>
+#include <iostream>
 #include <map>
 #include <random>
 #include <vector>
@@ -69,6 +70,15 @@ struct ggml_opt_context {
     struct ggml_tensor *          opt_step_params = nullptr; // Stores output of get_opt_pars.
 
     enum ggml_opt_optimizer_type optimizer = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
+
+    // global gradient-norm clip. max_grad_norm > 0 enables it; the SGD lr is scaled by a
+    // clip factor derived from the previous step's gradient norm (1-step lag).
+    float                 max_grad_norm = 0.0f;
+    float                 clip_scale    = 1.0f;
+    // scalar holding the global L2 norm of the parameter gradients. It is a node appended to
+    // gb_opt (see ggml_opt_build), so it is produced by the same compute as the backward/step
+    // and only this single float is read back on the host to derive clip_scale for the next step.
+    struct ggml_tensor  * grad_norm     = nullptr;
 };
 
 struct ggml_opt_result {
@@ -256,6 +266,7 @@ struct ggml_opt_params ggml_opt_default_params(
         /*get_opt_pars    =*/ ggml_opt_get_default_optimizer_params,
         /*get_opt_pars_ud =*/ nullptr,
         /*optimizer       =*/ GGML_OPT_OPTIMIZER_TYPE_ADAMW,
+        /*max_grad_norm   =*/ 0.0f,
     };
 }
 
@@ -537,6 +548,35 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         }
     }
 
+    // global grad-norm for clipping: the scalar ||g|| is reduced in-graph (appended to gb_opt)
+    // so the host reads only one float after the step.
+    opt_ctx->grad_norm = nullptr;
+    if (opt_ctx->max_grad_norm > 0.0f) {
+        int nclip = 0;
+        for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
+            const struct ggml_tensor * node = opt_ctx->gf->nodes[i];
+            if ((node->flags & GGML_TENSOR_FLAG_PARAM) && opt_ctx->grad_accs[i]) ++nclip;
+        }
+        if (opt_ctx->gb_opt->n_nodes + 3 * nclip + 2 <= opt_ctx->gb_opt->size) {
+            struct ggml_tensor * nrm = nullptr;
+            for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
+                const struct ggml_tensor * node = opt_ctx->gf->nodes[i];
+                if (!(node->flags & GGML_TENSOR_FLAG_PARAM)) continue;
+                struct ggml_tensor * grad = opt_ctx->grad_accs[i];
+                if (!grad) continue;
+                struct ggml_tensor * s = ggml_sum(opt_ctx->ctx_compute, ggml_mul(opt_ctx->ctx_compute, grad, grad));
+                nrm = nrm ? ggml_add(opt_ctx->ctx_compute, nrm, s) : s;
+            }
+            if (nrm) {
+                opt_ctx->grad_norm = ggml_sqrt(opt_ctx->ctx_compute, nrm);
+                ggml_format_name(opt_ctx->grad_norm, "grad_norm");
+                ggml_build_forward_expand(opt_ctx->gb_opt, opt_ctx->grad_norm);
+            }
+        } else {
+            std::cerr << "ggml_opt: insufficient graph headroom for grad-norm clip; clip disabled\n";
+        }
+    }
+
     if (!opt_ctx->buf_static) {
         opt_ctx->buf_static = ggml_backend_alloc_ctx_tensors(
             opt_ctx->ctx_static, ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0));
@@ -559,6 +599,7 @@ ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
     result->get_opt_pars     = params.get_opt_pars;
     result->get_opt_pars_ud  = params.get_opt_pars_ud;
     result->optimizer        = params.optimizer;
+    result->max_grad_norm    = params.max_grad_norm;
 
     GGML_ASSERT(result->opt_period >= 1);
 
@@ -813,7 +854,9 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
                 GGML_ASSERT(opt_pars.sgd.wd >= 0.0f);
                 GGML_ASSERT(opt_pars.sgd.wd <= 1.0f);
                 float * sgd = ggml_get_data_f32(opt_ctx->opt_step_params);
-                sgd[0] = opt_pars.sgd.alpha;
+                // global grad-norm clip (1-step lag): scale the lr by the clip factor
+                // derived from the previous step's gradient norm (see below).
+                sgd[0] = opt_pars.sgd.alpha * opt_ctx->clip_scale;
                 sgd[1] = opt_pars.sgd.wd;
             } break;
             default:
@@ -824,6 +867,15 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     ggml_backend_sched_graph_compute(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
     opt_ctx->iter += opt_ctx->allocated_graph == opt_ctx->gb_opt;
     opt_ctx->opt_i = (opt_ctx->opt_i + 1) % opt_ctx->opt_period;
+
+    // global grad-norm clip: read the scalar ||g|| the backward just produced (computed
+    // in-graph) and store the clip factor applied to the next step's lr (1-step lag).
+    if (opt_ctx->max_grad_norm > 0.0f && opt_ctx->grad_norm && opt_ctx->allocated_graph == opt_ctx->gb_opt) {
+        float norm = 0.0f;
+        ggml_backend_tensor_get(opt_ctx->grad_norm, &norm, 0, sizeof(float));
+        opt_ctx->clip_scale = (norm > opt_ctx->max_grad_norm) ?
+            opt_ctx->max_grad_norm / (norm + 1e-8f) : 1.0f;
+    }
 
     if (!opt_ctx->static_graphs) {
         opt_ctx->gf                   = nullptr;
